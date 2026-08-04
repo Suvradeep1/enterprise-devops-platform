@@ -1,0 +1,35 @@
+# Git
+.git
+.gitignore
+
+# Docker
+Dockerfile
+Dockerfile.*
+.dockerignore
+
+# Node
+node_modules
+npm-debug.log
+
+# Environment files
+.env
+.env.*
+
+# IDEs
+.vscode
+.idea
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Documentation
+README.md
+
+# Tests & Coverage
+coverage
+test
+tests
+
+# Logs
+*.log
