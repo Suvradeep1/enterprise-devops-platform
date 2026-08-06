@@ -1,5 +1,10 @@
 FROM node:20-alpine
 
+LABEL org.opencontainers.image.title="Enterprise DevOps Platform Backend"
+LABEL org.opencontainers.image.description="Production backend API for the Enterprise DevOps Platform"
+LABEL org.opencontainers.image.vendor="Suvradeep Chowdhury"
+LABEL org.opencontainers.image.source="https://github.com/Suvradeep1/enterprise-devops-platform"
+
 WORKDIR /usr/src/app
 
 ENV NODE_ENV=production
@@ -14,5 +19,8 @@ COPY --chown=node:node . .
 USER node
 
 EXPOSE 9000
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
+CMD node -e "require('http').get('http://localhost:9000/health',res=>process.exit(res.statusCode===200?0:1)).on('error',()=>process.exit(1))"
 
 CMD ["node", "index.js"]

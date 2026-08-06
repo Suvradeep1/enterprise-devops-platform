@@ -20,6 +20,11 @@ RUN npm run build
 
 FROM nginx:alpine
 
+LABEL org.opencontainers.image.title="Enterprise DevOps Platform Frontend"
+LABEL org.opencontainers.image.description="Production frontend for the Enterprise DevOps Platform"
+LABEL org.opencontainers.image.vendor="Suvradeep Chowdhury"
+LABEL org.opencontainers.image.source="https://github.com/Suvradeep1/enterprise-devops-platform"
+
 RUN rm -rf /usr/share/nginx/html/*
 
 COPY --from=builder /usr/src/app/dist /usr/share/nginx/html
