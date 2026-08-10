@@ -25,8 +25,10 @@ const pool = new Pool({
   user: process.env.POSTGRES_USER,
   password: process.env.POSTGRES_PASSWORD,
   database,
-  ssl: isProduction ? { rejectUnauthorized: false } : false,
+  ssl: false,
+  options: '-c search_path=public'   // 👈 ADD THIS
 });
+
 
 const originalQuery = pool.query.bind(pool);
 

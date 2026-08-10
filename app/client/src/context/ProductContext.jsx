@@ -10,15 +10,23 @@ const ProductProvider = ({ children }) => {
 
   useEffect(() => {
     setIsLoading(true);
+
     productService.getProducts(page).then((response) => {
-      setProducts(response.data);
+      setProducts(response.data.products);
       setIsLoading(false);
     });
   }, [page]);
 
   return (
     <ProductContext.Provider
-      value={{ products, setProducts, isLoading, setIsLoading, page, setPage }}
+      value={{
+        products,
+        setProducts,
+        isLoading,
+        setIsLoading,
+        page,
+        setPage,
+      }}
     >
       {children}
     </ProductContext.Provider>
@@ -27,9 +35,11 @@ const ProductProvider = ({ children }) => {
 
 const useProduct = () => {
   const context = useContext(ProductContext);
+
   if (context === undefined) {
     throw new Error("useProduct must be used within a ProductProvider");
   }
+
   return context;
 };
 
