@@ -1,16 +1,16 @@
+
 const router = require("express").Router();
 const {
   getAllProducts,
   createProduct,
-  getProduct,
   updateProduct,
   deleteProduct,
-  getProductByName,
   getProductReviews,
   createProductReview,
   updateProductReview,
   getProductBySlug,
 } = require("../controllers/products.controller");
+
 const verifyAdmin = require("../middleware/verifyAdmin");
 const verifyToken = require("../middleware/verifyToken");
 
@@ -22,8 +22,6 @@ router
 router
   .route("/:slug")
   .get(getProductBySlug)
-  // .get(getProduct)
-  // .get(getProductByName)
   .put(verifyToken, verifyAdmin, updateProduct)
   .delete(verifyToken, verifyAdmin, deleteProduct);
 
@@ -34,3 +32,4 @@ router
   .put(verifyToken, updateProductReview);
 
 module.exports = router;
+
