@@ -16,8 +16,10 @@ describe("/api/auth/signup", () => {
       fullname: "test db",
       username: "test",
     });
-    expect(res.body).toHaveProperty("userId");
-    expect(res.body).toHaveProperty("cartId");
+    expect(res.body).toHaveProperty("token");
+    expect(res.body).toHaveProperty("user");
+    expect(res.body.user).toHaveProperty("user_id");
+    expect(res.body.user).toHaveProperty("email", "email@email.com");
     expect(res.statusCode).toBe(201);
   });
 
