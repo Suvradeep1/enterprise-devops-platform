@@ -94,7 +94,7 @@ CREATE TABLE public.users
 ALTER TABLE public.cart
     ADD FOREIGN KEY (user_id)
     REFERENCES public.users (user_id)
-    ON DELETE SET NULL
+    ON DELETE CASCADE
     NOT VALID;
 
 
