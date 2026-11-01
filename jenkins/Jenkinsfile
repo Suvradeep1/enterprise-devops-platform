@@ -1,6 +1,10 @@
-
 pipeline {
     agent any
+
+    options {
+        skipDefaultCheckout(true)
+        disableConcurrentBuilds()
+    }
 
     stages {
 
@@ -15,7 +19,9 @@ pipeline {
                 sh '''
                     echo "Latest Commit:"
                     git log -1 --oneline
-                    echo "Commit ID: $(git rev-parse HEAD)"
+
+                    echo "Commit ID:"
+                    git rev-parse HEAD
                 '''
             }
         }
@@ -25,8 +31,10 @@ pipeline {
                 sh '''
                     test -f app/server/package.json
                     test -f app/server/package-lock.json
+                    test -f app/server/config/init.sql
                     test -f app/client/package.json
                     test -f app/client/package-lock.json
+
                     echo "Project structure verified!"
                 '''
             }
@@ -47,15 +55,126 @@ pipeline {
                 }
             }
         }
+
+        stage('Backend Tests') {
+            steps {
+                dir('app/server') {
+                    withEnv([
+                        "TEST_DB_CONTAINER=jenkins-test-db-${env.BUILD_NUMBER}",
+                        "POSTGRES_USER=ci_user",
+                        "POSTGRES_PASSWORD=ci-only-temporary-password",
+                        "POSTGRES_DB_TEST=enterprise_test",
+                        "SECRET=ci-only-test-access-secret",
+                        "REFRESH_SECRET=ci-only-test-refresh-secret"
+                    ]) {
+                        sh '''
+                            set +x
+                            set -eu
+
+                            cleanup() {
+                                echo "===== CLEANING TEST DATABASE ====="
+                                docker rm -f "$TEST_DB_CONTAINER" \
+                                    >/dev/null 2>&1 || true
+                            }
+
+                            trap cleanup EXIT
+
+                            echo "===== STARTING POSTGRESQL 18 ====="
+
+                            docker run -d \
+                                --name "$TEST_DB_CONTAINER" \
+                                --restart=no \
+                                --memory=512m \
+                                -e POSTGRES_USER="$POSTGRES_USER" \
+                                -e POSTGRES_PASSWORD="$POSTGRES_PASSWORD" \
+                                -e POSTGRES_DB="$POSTGRES_DB_TEST" \
+                                -p 127.0.0.1::5432 \
+                                --health-cmd="pg_isready -U $POSTGRES_USER -d $POSTGRES_DB_TEST" \
+                                --health-interval=5s \
+                                --health-timeout=3s \
+                                --health-retries=20 \
+                                postgres:18 >/dev/null
+
+                            echo "===== WAITING FOR DATABASE ====="
+
+                            status=starting
+
+                            for attempt in $(seq 1 30); do
+                                status=$(docker inspect \
+                                    --format='{{.State.Health.Status}}' \
+                                    "$TEST_DB_CONTAINER")
+
+                                if [ "$status" = "healthy" ]; then
+                                    break
+                                fi
+
+                                container_state=$(docker inspect \
+                                    --format='{{.State.Status}}' \
+                                    "$TEST_DB_CONTAINER")
+
+                                if [ "$container_state" = "exited" ] || \
+                                   [ "$container_state" = "dead" ]; then
+                                    docker logs "$TEST_DB_CONTAINER"
+                                    exit 1
+                                fi
+
+                                sleep 2
+                            done
+
+                            if [ "$status" != "healthy" ]; then
+                                echo "PostgreSQL failed to become healthy"
+                                docker logs "$TEST_DB_CONTAINER"
+                                exit 1
+                            fi
+
+                            echo "PostgreSQL is healthy!"
+
+                            echo "===== CONFIGURING DATABASE CONNECTION ====="
+
+                            POSTGRES_PORT=$(docker port \
+                                "$TEST_DB_CONTAINER" 5432/tcp \
+                                | awk -F: 'NR == 1 {print $NF}')
+
+                            if [ -z "$POSTGRES_PORT" ]; then
+                                echo "Could not determine PostgreSQL port"
+                                exit 1
+                            fi
+
+                            export POSTGRES_HOST=127.0.0.1
+                            export POSTGRES_PORT
+
+                            echo "===== INITIALIZING DATABASE SCHEMA ====="
+
+                            docker exec -i "$TEST_DB_CONTAINER" \
+                                psql -v ON_ERROR_STOP=1 \
+                                -U "$POSTGRES_USER" \
+                                -d "$POSTGRES_DB_TEST" \
+                                < config/init.sql
+
+                            echo "===== RUNNING BACKEND JEST TESTS ====="
+
+                            export NODE_ENV=test
+                            npm test
+
+                            echo "===== BACKEND TESTS COMPLETED ====="
+                        '''
+                    }
+                }
+            }
+        }
     }
 
     post {
         success {
-            echo 'Backend CI stages completed successfully!'
+            echo 'Backend CI and Jest tests completed successfully!'
         }
 
         failure {
             echo 'Backend CI pipeline failed. Check the console output.'
+        }
+
+        always {
+            echo 'Pipeline execution finished.'
         }
     }
 }
