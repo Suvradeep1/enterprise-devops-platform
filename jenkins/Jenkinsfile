@@ -1,0 +1,48 @@
+
+pipeline {
+    agent any
+
+    stages {
+
+        stage('Checkout Source Code') {
+            steps {
+                checkout scm
+            }
+        }
+
+        stage('Display Git Information') {
+            steps {
+                sh '''
+                    echo "Branch: $(git branch --show-current)"
+                    echo "Latest Commit:"
+                    git log -1 --oneline
+                '''
+            }
+        }
+
+        stage('Verify Project Structure') {
+            steps {
+                sh '''
+                    echo "Checking project files..."
+
+                    test -f app/server/package.json
+                    test -f app/client/package.json
+                    test -f app/server/Dockerfile.prod
+                    test -f app/client/Dockerfile.prod
+
+                    echo "Project structure verified successfully!"
+                '''
+            }
+        }
+    }
+
+    post {
+        success {
+            echo 'First CI pipeline completed successfully!'
+        }
+
+        failure {
+            echo 'First CI pipeline failed. Check the console output.'
+        }
+    }
+}
