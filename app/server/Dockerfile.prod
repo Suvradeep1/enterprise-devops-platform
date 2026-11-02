@@ -1,4 +1,4 @@
-FROM node:20-alpine
+FROM node:24-alpine
 
 LABEL org.opencontainers.image.title="Enterprise DevOps Platform Backend"
 LABEL org.opencontainers.image.description="Production backend API for the Enterprise DevOps Platform"
