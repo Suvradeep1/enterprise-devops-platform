@@ -1,9 +1,19 @@
+
 pipeline {
     agent any
 
     options {
         skipDefaultCheckout(true)
         disableConcurrentBuilds()
+        timestamps()
+    }
+
+    environment {
+        AWS_REGION = 'ap-south-1'
+        ECR_REGISTRY = '742986823560.dkr.ecr.ap-south-1.amazonaws.com'
+
+        BACKEND_ECR_REPOSITORY = 'enterprise-backend'
+        FRONTEND_ECR_REPOSITORY = 'enterprise-frontend'
     }
 
     stages {
@@ -17,28 +27,45 @@ pipeline {
         stage('Display Git Information') {
             steps {
                 sh '''
-                    echo "Latest Commit:"
+                    echo "===== GIT INFORMATION ====="
                     git log -1 --oneline
-
-                    echo "Commit ID:"
                     git rev-parse HEAD
                 '''
+
+                script {
+                    env.IMAGE_TAG = sh(
+                        script: 'git rev-parse --short=7 HEAD',
+                        returnStdout: true
+                    ).trim()
+                }
             }
         }
 
         stage('Verify Project Structure') {
             steps {
                 sh '''
+                    set -eu
+
+                    echo "===== VERIFYING PROJECT FILES ====="
+
                     test -f app/server/package.json
                     test -f app/server/package-lock.json
                     test -f app/server/config/init.sql
+                    test -f app/server/Dockerfile.prod
+
                     test -f app/client/package.json
                     test -f app/client/package-lock.json
+                    test -f app/client/Dockerfile.prod
+                    test -f app/client/nginx.conf
 
                     echo "Project structure verified!"
                 '''
             }
         }
+
+        // ==============================
+        // BACKEND CI
+        // ==============================
 
         stage('Backend Dependency Installation') {
             steps {
@@ -79,7 +106,7 @@ pipeline {
 
                             trap cleanup EXIT
 
-                            echo "===== STARTING POSTGRESQL 18 ====="
+                            echo "===== STARTING TEST POSTGRESQL ====="
 
                             docker run -d \
                                 --name "$TEST_DB_CONTAINER" \
@@ -95,7 +122,7 @@ pipeline {
                                 --health-retries=20 \
                                 postgres:18 >/dev/null
 
-                            echo "===== WAITING FOR DATABASE ====="
+                            echo "===== WAITING FOR POSTGRESQL ====="
 
                             status=starting
 
@@ -129,8 +156,6 @@ pipeline {
 
                             echo "PostgreSQL is healthy!"
 
-                            echo "===== CONFIGURING DATABASE CONNECTION ====="
-
                             POSTGRES_PORT=$(docker port \
                                 "$TEST_DB_CONTAINER" 5432/tcp \
                                 | awk -F: 'NR == 1 {print $NF}')
@@ -142,6 +167,7 @@ pipeline {
 
                             export POSTGRES_HOST=127.0.0.1
                             export POSTGRES_PORT
+                            export NODE_ENV=test
 
                             echo "===== INITIALIZING DATABASE SCHEMA ====="
 
@@ -151,26 +177,335 @@ pipeline {
                                 -d "$POSTGRES_DB_TEST" \
                                 < config/init.sql
 
-                            echo "===== RUNNING BACKEND JEST TESTS ====="
+                            echo "===== RUNNING BACKEND TESTS ====="
 
-                            export NODE_ENV=test
                             npm test
 
-                            echo "===== BACKEND TESTS COMPLETED ====="
+                            echo "Backend tests completed!"
                         '''
                     }
                 }
+            }
+        }
+
+        // ==============================
+        // FRONTEND CI
+        // ==============================
+
+        stage('Frontend Dependency Installation') {
+            steps {
+                dir('app/client') {
+                    sh 'npm ci --legacy-peer-deps'
+                }
+            }
+        }
+
+        stage('Frontend Lint and Tests') {
+            steps {
+                dir('app/client') {
+                    sh '''
+                        set -eu
+
+                        echo "===== CHECKING FRONTEND SCRIPTS ====="
+
+                        node -e "
+                            const p = require('./package.json');
+                            console.log(JSON.stringify(p.scripts || {}, null, 2));
+                        "
+
+                        if node -e "process.exit(require('./package.json').scripts?.lint ? 0 : 1)"; then
+                            echo "===== RUNNING FRONTEND LINT ====="
+                            npm run lint
+                        else
+                            echo "No frontend lint script configured; skipping."
+                        fi
+
+                        if node -e "process.exit(require('./package.json').scripts?.test ? 0 : 1)"; then
+                            echo "===== RUNNING FRONTEND TESTS ====="
+                            npm test -- --run
+                        else
+                            echo "No frontend test script configured; skipping."
+                        fi
+                    '''
+                }
+            }
+        }
+
+        // ==============================
+        // BACKEND DOCKER
+        // ==============================
+
+        stage('Build Backend Docker Image') {
+            steps {
+                dir('app/server') {
+                    sh '''
+                        set -eu
+
+                        echo "===== BUILDING BACKEND IMAGE ====="
+
+                        docker build --pull \
+                            -f Dockerfile.prod \
+                            -t enterprise-backend:${IMAGE_TAG} \
+                            .
+
+                        echo "Backend image built successfully!"
+                    '''
+                }
+            }
+        }
+
+        stage('Validate Backend Docker Image') {
+            steps {
+                withEnv([
+                    "TEST_CONTAINER=jenkins-backend-test-${env.BUILD_NUMBER}",
+                    "TEST_IMAGE=enterprise-backend:${env.IMAGE_TAG}"
+                ]) {
+                    sh '''
+                        set -eu
+
+                        cleanup() {
+                            docker rm -f "$TEST_CONTAINER" \
+                                >/dev/null 2>&1 || true
+                        }
+
+                        trap cleanup EXIT
+
+                        echo "===== STARTING BACKEND CONTAINER ====="
+
+                        docker run -d \
+                            --name "$TEST_CONTAINER" \
+                            --restart=no \
+                            --memory=512m \
+                            -e PORT=9000 \
+                            -p 127.0.0.1::9000 \
+                            "$TEST_IMAGE" >/dev/null
+
+                        echo "===== WAITING FOR BACKEND HEALTH ====="
+
+                        status=starting
+
+                        for attempt in $(seq 1 40); do
+                            status=$(docker inspect \
+                                --format='{{.State.Health.Status}}' \
+                                "$TEST_CONTAINER")
+
+                            if [ "$status" = "healthy" ]; then
+                                break
+                            fi
+
+                            container_state=$(docker inspect \
+                                --format='{{.State.Status}}' \
+                                "$TEST_CONTAINER")
+
+                            if [ "$container_state" = "exited" ] || \
+                               [ "$container_state" = "dead" ]; then
+                                docker logs "$TEST_CONTAINER"
+                                exit 1
+                            fi
+
+                            sleep 3
+                        done
+
+                        if [ "$status" != "healthy" ]; then
+                            docker logs "$TEST_CONTAINER"
+                            docker inspect "$TEST_CONTAINER"
+                            exit 1
+                        fi
+
+                        echo "===== CHECKING BACKEND HTTP ENDPOINT ====="
+
+                        HOST_PORT=$(docker port "$TEST_CONTAINER" 9000/tcp \
+                            | awk -F: 'NR == 1 {print $NF}')
+
+                        HTTP_STATUS=$(curl -sS \
+                            -o /tmp/backend-health-${BUILD_NUMBER}.json \
+                            -w '%{http_code}' \
+                            "http://127.0.0.1:${HOST_PORT}/health")
+
+                        cat "/tmp/backend-health-${BUILD_NUMBER}.json"
+
+                        if [ "$HTTP_STATUS" != "200" ]; then
+                            echo "Backend HTTP health validation failed"
+                            exit 1
+                        fi
+
+                        echo "Backend image passed validation!"
+                    '''
+                }
+            }
+        }
+
+        // ==============================
+        // FRONTEND DOCKER
+        // ==============================
+
+        stage('Build Frontend Docker Image') {
+            steps {
+                dir('app/client') {
+                    sh '''
+                        set -eu
+
+                        echo "===== BUILDING FRONTEND IMAGE ====="
+
+                        docker build --pull \
+                            -f Dockerfile.prod \
+                            -t enterprise-frontend:${IMAGE_TAG} \
+                            .
+
+                        echo "Frontend image built successfully!"
+                    '''
+                }
+            }
+        }
+
+        stage('Validate Frontend Docker Image') {
+            steps {
+                withEnv([
+                    "TEST_CONTAINER=jenkins-frontend-test-${env.BUILD_NUMBER}",
+                    "TEST_IMAGE=enterprise-frontend:${env.IMAGE_TAG}"
+                ]) {
+                    sh '''
+                        set -eu
+
+                        cleanup() {
+                            docker rm -f "$TEST_CONTAINER" \
+                                >/dev/null 2>&1 || true
+                        }
+
+                        trap cleanup EXIT
+
+                        echo "===== STARTING FRONTEND CONTAINER ====="
+
+                        docker run -d \
+                            --name "$TEST_CONTAINER" \
+                            --restart=no \
+                            --memory=256m \
+                            -p 127.0.0.1::80 \
+                            "$TEST_IMAGE" >/dev/null
+
+                        echo "===== WAITING FOR NGINX ====="
+
+                        HOST_PORT=$(docker port "$TEST_CONTAINER" 80/tcp \
+                            | awk -F: 'NR == 1 {print $NF}')
+
+                        HTTP_STATUS=000
+
+                        for attempt in $(seq 1 30); do
+                            HTTP_STATUS=$(curl -sS \
+                                -o /tmp/frontend-health-${BUILD_NUMBER}.html \
+                                -w '%{http_code}' \
+                                "http://127.0.0.1:${HOST_PORT}/" \
+                                || true)
+
+                            if [ "$HTTP_STATUS" = "200" ]; then
+                                break
+                            fi
+
+                            sleep 2
+                        done
+
+                        if [ "$HTTP_STATUS" != "200" ]; then
+                            echo "Frontend HTTP validation failed"
+                            docker logs "$TEST_CONTAINER"
+                            exit 1
+                        fi
+
+                        echo "Frontend HTTP response:"
+                        head -c 500 "/tmp/frontend-health-${BUILD_NUMBER}.html"
+
+                        echo ""
+                        echo "Frontend image passed validation!"
+                    '''
+                }
+            }
+        }
+
+        // ==============================
+        // ECR PUBLISHING
+        // ==============================
+
+        stage('Authenticate with Amazon ECR') {
+            steps {
+                sh '''
+                    set -eu
+
+                    echo "===== AUTHENTICATING WITH ECR ====="
+
+                    aws ecr get-login-password \
+                        --region "$AWS_REGION" | \
+                    docker login \
+                        --username AWS \
+                        --password-stdin "$ECR_REGISTRY"
+                '''
+            }
+        }
+
+        stage('Push Backend Image to ECR') {
+            steps {
+                sh '''
+                    set -eu
+
+                    ECR_IMAGE="${ECR_REGISTRY}/${BACKEND_ECR_REPOSITORY}:${IMAGE_TAG}"
+
+                    echo "===== TAGGING BACKEND IMAGE ====="
+
+                    docker tag \
+                        "enterprise-backend:${IMAGE_TAG}" \
+                        "$ECR_IMAGE"
+
+                    echo "===== PUSHING BACKEND IMAGE ====="
+
+                    docker push "$ECR_IMAGE"
+
+                    echo "===== VERIFYING BACKEND IMAGE ====="
+
+                    aws ecr describe-images \
+                        --repository-name "$BACKEND_ECR_REPOSITORY" \
+                        --region "$AWS_REGION" \
+                        --image-ids imageTag="$IMAGE_TAG" \
+                        --output json
+                '''
+            }
+        }
+
+        stage('Push Frontend Image to ECR') {
+            steps {
+                sh '''
+                    set -eu
+
+                    ECR_IMAGE="${ECR_REGISTRY}/${FRONTEND_ECR_REPOSITORY}:${IMAGE_TAG}"
+
+                    echo "===== TAGGING FRONTEND IMAGE ====="
+
+                    docker tag \
+                        "enterprise-frontend:${IMAGE_TAG}" \
+                        "$ECR_IMAGE"
+
+                    echo "===== PUSHING FRONTEND IMAGE ====="
+
+                    docker push "$ECR_IMAGE"
+
+                    echo "===== VERIFYING FRONTEND IMAGE ====="
+
+                    aws ecr describe-images \
+                        --repository-name "$FRONTEND_ECR_REPOSITORY" \
+                        --region "$AWS_REGION" \
+                        --image-ids imageTag="$IMAGE_TAG" \
+                        --output json
+                '''
             }
         }
     }
 
     post {
         success {
-            echo 'Backend CI and Jest tests completed successfully!'
+            echo "Backend and Frontend CI/CD image publishing completed successfully."
+            echo "Backend: ${ECR_REGISTRY}/${BACKEND_ECR_REPOSITORY}:${IMAGE_TAG}"
+            echo "Frontend: ${ECR_REGISTRY}/${FRONTEND_ECR_REPOSITORY}:${IMAGE_TAG}"
         }
 
         failure {
-            echo 'Backend CI pipeline failed. Check the console output.'
+            echo 'Pipeline failed. Check the Jenkins console output.'
         }
 
         always {
