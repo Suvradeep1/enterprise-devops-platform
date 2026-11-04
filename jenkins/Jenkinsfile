@@ -30,6 +30,7 @@ pipeline {
                     echo "===== GIT INFORMATION ====="
                     git log -1 --oneline
                     git rev-parse HEAD
+		     echo "Previous successful commit: ${env.GIT_PREVIOUS_SUCCESSFUL_COMMIT ?: 'NOT AVAILABLE'}"
                 '''
 
                 script {
