@@ -18,22 +18,29 @@ pipeline {
 
     stages {
 
+        // ==========================================
+        // 1. CHECKOUT SOURCE CODE
+        // ==========================================
+
         stage('Checkout Source Code') {
             steps {
                 checkout scm
             }
         }
 
+        // ==========================================
+        // 2. DISPLAY GIT INFORMATION
+        // ==========================================
+
         stage('Display Git Information') {
             steps {
-        sh '''
-            echo "===== GIT INFORMATION ====="
-            git log -1 --oneline
-            git rev-parse HEAD
-        '''
+                sh '''
+                    echo "===== GIT INFORMATION ====="
+                    git log -1 --oneline
+                    git rev-parse HEAD
+                '''
 
-        echo "Previous successful commit: ${env.GIT_PREVIOUS_SUCCESSFUL_COMMIT ?: 'NOT AVAILABLE'}"
-
+                echo "Previous successful commit: ${env.GIT_PREVIOUS_SUCCESSFUL_COMMIT ?: 'NOT AVAILABLE'}"
 
                 script {
                     env.IMAGE_TAG = sh(
@@ -44,33 +51,167 @@ pipeline {
             }
         }
 
+        // ==========================================
+        // 3. DETECT CHANGED APPLICATIONS
+        // ==========================================
+
+        stage('Detect Changed Applications') {
+            steps {
+                script {
+                    def previousCommit =
+                        env.GIT_PREVIOUS_SUCCESSFUL_COMMIT?.trim()
+
+                    def currentCommit = sh(
+                        script: 'git rev-parse HEAD',
+                        returnStdout: true
+                    ).trim()
+
+                    def buildBackend = false
+                    def buildFrontend = false
+
+                    echo "Current commit: ${currentCommit}"
+                    echo "Previous successful commit: ${previousCommit ?: 'NOT AVAILABLE'}"
+
+                    // Safe fallback: build both if no valid baseline exists.
+
+                    def validBaseline = previousCommit &&
+                        sh(
+                            script: "git cat-file -e '${previousCommit}^{commit}'",
+                            returnStatus: true
+                        ) == 0
+
+                    if (!validBaseline) {
+                        echo 'No valid previous successful commit found.'
+                        echo 'Safely building both applications.'
+
+                        buildBackend = true
+                        buildFrontend = true
+
+                    } else {
+
+                        def changedOutput = sh(
+                            script: "git diff --name-only '${previousCommit}' '${currentCommit}'",
+                            returnStdout: true
+                        ).trim()
+
+                        def changedFiles = changedOutput ?
+                            changedOutput.readLines() : []
+
+                        echo '===== CHANGED FILES ====='
+
+                        changedFiles.each { file ->
+                            echo file
+                        }
+
+                        if (changedFiles.isEmpty()) {
+                            echo 'No changed files detected. Safe fallback: build both.'
+
+                            buildBackend = true
+                            buildFrontend = true
+
+                        } else {
+
+                            changedFiles.each { file ->
+
+                                if (file.startsWith('app/server/')) {
+                                    buildBackend = true
+                                    echo "Backend change detected: ${file}"
+
+                                } else if (file.startsWith('app/client/')) {
+                                    buildFrontend = true
+                                    echo "Frontend change detected: ${file}"
+
+                                } else if (
+                                    file.startsWith('jenkins/') ||
+                                    file == 'Jenkinsfile' ||
+                                    file == 'package.json' ||
+                                    file == 'package-lock.json' ||
+                                    file == '.gitignore' ||
+                                    file.startsWith('app/')
+                                ) {
+                                    // Shared or CI changes affect both.
+
+                                    buildBackend = true
+                                    buildFrontend = true
+
+                                    echo "Shared configuration change detected: ${file}"
+
+                                } else if (
+                                    file.startsWith('docs/') ||
+                                    file.toLowerCase().endsWith('.md') ||
+                                    file == 'LICENSE'
+                                ) {
+                                    echo "Documentation-only change: ${file}"
+
+                                } else {
+                                    // Unknown changes use a safe default.
+
+                                    buildBackend = true
+                                    buildFrontend = true
+
+                                    echo "Unclassified change; building both: ${file}"
+                                }
+                            }
+                        }
+                    }
+
+                    env.BUILD_BACKEND = buildBackend.toString()
+                    env.BUILD_FRONTEND = buildFrontend.toString()
+
+                    echo '===== BUILD DECISION ====='
+                    echo "Build Backend: ${env.BUILD_BACKEND}"
+                    echo "Build Frontend: ${env.BUILD_FRONTEND}"
+                    echo "Image Tag: ${env.IMAGE_TAG}"
+                }
+            }
+        }
+
+        // ==========================================
+        // 4. VERIFY PROJECT STRUCTURE
+        // ==========================================
+
         stage('Verify Project Structure') {
+            when {
+                expression {
+                    env.BUILD_BACKEND == 'true' ||
+                    env.BUILD_FRONTEND == 'true'
+                }
+            }
+
             steps {
                 sh '''
                     set -eu
 
                     echo "===== VERIFYING PROJECT FILES ====="
 
-                    test -f app/server/package.json
-                    test -f app/server/package-lock.json
-                    test -f app/server/config/init.sql
-                    test -f app/server/Dockerfile.prod
+                    if [ "$BUILD_BACKEND" = "true" ]; then
+                        test -f app/server/package.json
+                        test -f app/server/package-lock.json
+                        test -f app/server/config/init.sql
+                        test -f app/server/Dockerfile.prod
+                    fi
 
-                    test -f app/client/package.json
-                    test -f app/client/package-lock.json
-                    test -f app/client/Dockerfile.prod
-                    test -f app/client/nginx.conf
+                    if [ "$BUILD_FRONTEND" = "true" ]; then
+                        test -f app/client/package.json
+                        test -f app/client/package-lock.json
+                        test -f app/client/Dockerfile.prod
+                        test -f app/client/nginx.conf
+                    fi
 
                     echo "Project structure verified!"
                 '''
             }
         }
 
-        // ==============================
+        // ==========================================
         // BACKEND CI
-        // ==============================
+        // ==========================================
 
         stage('Backend Dependency Installation') {
+            when {
+                expression { env.BUILD_BACKEND == 'true' }
+            }
+
             steps {
                 dir('app/server') {
                     sh 'npm ci'
@@ -79,6 +220,10 @@ pipeline {
         }
 
         stage('Backend Lint') {
+            when {
+                expression { env.BUILD_BACKEND == 'true' }
+            }
+
             steps {
                 dir('app/server') {
                     sh 'npm run lint'
@@ -87,6 +232,10 @@ pipeline {
         }
 
         stage('Backend Tests') {
+            when {
+                expression { env.BUILD_BACKEND == 'true' }
+            }
+
             steps {
                 dir('app/server') {
                     withEnv([
@@ -191,11 +340,15 @@ pipeline {
             }
         }
 
-        // ==============================
+        // ==========================================
         // FRONTEND CI
-        // ==============================
+        // ==========================================
 
         stage('Frontend Dependency Installation') {
+            when {
+                expression { env.BUILD_FRONTEND == 'true' }
+            }
+
             steps {
                 dir('app/client') {
                     sh 'npm ci --legacy-peer-deps'
@@ -204,6 +357,10 @@ pipeline {
         }
 
         stage('Frontend Lint and Tests') {
+            when {
+                expression { env.BUILD_FRONTEND == 'true' }
+            }
+
             steps {
                 dir('app/client') {
                     sh '''
@@ -234,11 +391,15 @@ pipeline {
             }
         }
 
-        // ==============================
+        // ==========================================
         // BACKEND DOCKER
-        // ==============================
+        // ==========================================
 
         stage('Build Backend Docker Image') {
+            when {
+                expression { env.BUILD_BACKEND == 'true' }
+            }
+
             steps {
                 dir('app/server') {
                     sh '''
@@ -258,6 +419,10 @@ pipeline {
         }
 
         stage('Validate Backend Docker Image') {
+            when {
+                expression { env.BUILD_BACKEND == 'true' }
+            }
+
             steps {
                 withEnv([
                     "TEST_CONTAINER=jenkins-backend-test-${env.BUILD_NUMBER}",
@@ -338,11 +503,15 @@ pipeline {
             }
         }
 
-        // ==============================
+        // ==========================================
         // FRONTEND DOCKER
-        // ==============================
+        // ==========================================
 
         stage('Build Frontend Docker Image') {
+            when {
+                expression { env.BUILD_FRONTEND == 'true' }
+            }
+
             steps {
                 dir('app/client') {
                     sh '''
@@ -362,6 +531,10 @@ pipeline {
         }
 
         stage('Validate Frontend Docker Image') {
+            when {
+                expression { env.BUILD_FRONTEND == 'true' }
+            }
+
             steps {
                 withEnv([
                     "TEST_CONTAINER=jenkins-frontend-test-${env.BUILD_NUMBER}",
@@ -423,11 +596,18 @@ pipeline {
             }
         }
 
-        // ==============================
-        // ECR PUBLISHING
-        // ==============================
+        // ==========================================
+        // ECR AUTHENTICATION
+        // ==========================================
 
         stage('Authenticate with Amazon ECR') {
+            when {
+                expression {
+                    env.BUILD_BACKEND == 'true' ||
+                    env.BUILD_FRONTEND == 'true'
+                }
+            }
+
             steps {
                 sh '''
                     set -eu
@@ -443,7 +623,15 @@ pipeline {
             }
         }
 
+        // ==========================================
+        // PUSH BACKEND IMAGE
+        // ==========================================
+
         stage('Push Backend Image to ECR') {
+            when {
+                expression { env.BUILD_BACKEND == 'true' }
+            }
+
             steps {
                 sh '''
                     set -eu
@@ -471,7 +659,15 @@ pipeline {
             }
         }
 
+        // ==========================================
+        // PUSH FRONTEND IMAGE
+        // ==========================================
+
         stage('Push Frontend Image to ECR') {
+            when {
+                expression { env.BUILD_FRONTEND == 'true' }
+            }
+
             steps {
                 sh '''
                     set -eu
@@ -500,11 +696,32 @@ pipeline {
         }
     }
 
+    // ==========================================
+    // POST BUILD ACTIONS
+    // ==========================================
+
     post {
         success {
-            echo "Backend and Frontend CI/CD image publishing completed successfully."
-            echo "Backend: ${ECR_REGISTRY}/${BACKEND_ECR_REPOSITORY}:${IMAGE_TAG}"
-            echo "Frontend: ${ECR_REGISTRY}/${FRONTEND_ECR_REPOSITORY}:${IMAGE_TAG}"
+            echo 'Selective CI and ECR publishing completed successfully.'
+
+            echo "Commit: ${env.IMAGE_TAG}"
+            echo "Backend built: ${env.BUILD_BACKEND}"
+            echo "Frontend built: ${env.BUILD_FRONTEND}"
+
+            script {
+                if (env.BUILD_BACKEND == 'true') {
+                    echo "Backend image: ${env.ECR_REGISTRY}/${env.BACKEND_ECR_REPOSITORY}:${env.IMAGE_TAG}"
+                }
+
+                if (env.BUILD_FRONTEND == 'true') {
+                    echo "Frontend image: ${env.ECR_REGISTRY}/${env.FRONTEND_ECR_REPOSITORY}:${env.IMAGE_TAG}"
+                }
+
+                if (env.BUILD_BACKEND == 'false' &&
+                    env.BUILD_FRONTEND == 'false') {
+                    echo 'Documentation-only change. No images were built or pushed.'
+                }
+            }
         }
 
         failure {
