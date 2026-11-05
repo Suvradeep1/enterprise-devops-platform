@@ -1,78 +1,85 @@
-
 pipeline {
     agent any
 
     options {
-        skipDefaultCheckout(true)
-        disableConcurrentBuilds()
         timestamps()
+        disableConcurrentBuilds()
+        skipDefaultCheckout(true)
     }
 
     environment {
         AWS_REGION = 'ap-south-1'
         ECR_REGISTRY = '742986823560.dkr.ecr.ap-south-1.amazonaws.com'
-
         BACKEND_ECR_REPOSITORY = 'enterprise-backend'
         FRONTEND_ECR_REPOSITORY = 'enterprise-frontend'
+
+        IMAGE_TAG = ''
+        CURRENT_COMMIT = ''
+        BUILD_BACKEND = 'false'
+        BUILD_FRONTEND = 'false'
     }
 
     stages {
-
-        // ==========================================
-        // 1. CHECKOUT SOURCE CODE
-        // ==========================================
-
         stage('Checkout Source Code') {
             steps {
                 checkout scm
             }
         }
 
-        // ==========================================
-        // 2. DISPLAY GIT INFORMATION
-        // ==========================================
-
         stage('Display Git Information') {
             steps {
-                sh '''
-                    echo "===== GIT INFORMATION ====="
-                    git log -1 --oneline
-                    git rev-parse HEAD
-                '''
-
-                echo "Previous successful commit: ${env.GIT_PREVIOUS_SUCCESSFUL_COMMIT ?: 'NOT AVAILABLE'}"
-
                 script {
-                    env.IMAGE_TAG = sh(
-                        script: 'git rev-parse --short=7 HEAD',
-                        returnStdout: true
-                    ).trim()
-                }
-            }
-        }
-
-        // ==========================================
-        // 3. DETECT CHANGED APPLICATIONS
-        // ==========================================
-
-        stage('Detect Changed Applications') {
-            steps {
-                script {
-                    def previousCommit =
-                        env.GIT_PREVIOUS_SUCCESSFUL_COMMIT?.trim()
-
-                    def currentCommit = sh(
+                    env.CURRENT_COMMIT = sh(
                         script: 'git rev-parse HEAD',
                         returnStdout: true
                     ).trim()
 
+                    env.IMAGE_TAG = env.CURRENT_COMMIT.take(7)
+
+                    sh '''
+                        set -eu
+                        echo '===== GIT INFORMATION ====='
+                        git status --short
+                        git log -1 --oneline
+                        git rev-parse HEAD
+                    '''
+
+                    echo "Current commit: ${env.CURRENT_COMMIT}"
+                    echo "Image tag: ${env.IMAGE_TAG}"
+                }
+            }
+        }
+
+        stage('Detect Changed Applications') {
+            steps {
+                script {
+                    def previousCommit = env.GIT_PREVIOUS_SUCCESSFUL_COMMIT?.trim()
+                    def previousSuccessfulBuild = currentBuild.previousSuccessfulBuild
+
+                    // Jenkins may not populate GIT_PREVIOUS_SUCCESSFUL_COMMIT.
+                    // After each successful run, this pipeline stores the commit
+                    // SHA in that build's description as CI_COMMIT=<full SHA>.
+                    if (!previousCommit && previousSuccessfulBuild != null) {
+                        def previousDescription = previousSuccessfulBuild.description ?: ''
+                        def matcher = (previousDescription =~ /CI_COMMIT=([0-9a-fA-F]{40})/)
+
+                        if (matcher.find()) {
+                            previousCommit = matcher.group(1)
+                            echo "Baseline retrieved from previous successful build #${previousSuccessfulBuild.number}."
+                        }
+                    }
+
+                    // Accept only a full Git SHA before using it in Git commands.
+                    if (previousCommit && !(previousCommit ==~ /[0-9a-fA-F]{40}/)) {
+                        echo 'Previous commit value is not a valid full Git SHA; ignoring it.'
+                        previousCommit = null
+                    }
+
                     def buildBackend = false
                     def buildFrontend = false
 
-                    echo "Current commit: ${currentCommit}"
+                    echo "Current commit: ${env.CURRENT_COMMIT}"
                     echo "Previous successful commit: ${previousCommit ?: 'NOT AVAILABLE'}"
-
-                    // Safe fallback: build both if no valid baseline exists.
 
                     def validBaseline = previousCommit &&
                         sh(
@@ -82,75 +89,55 @@ pipeline {
 
                     if (!validBaseline) {
                         echo 'No valid previous successful commit found.'
-                        echo 'Safely building both applications.'
-
+                        echo 'Safe first-run fallback: building both applications.'
                         buildBackend = true
                         buildFrontend = true
-
                     } else {
-
                         def changedOutput = sh(
-                            script: "git diff --name-only '${previousCommit}' '${currentCommit}'",
+                            script: "git diff --name-only '${previousCommit}' '${env.CURRENT_COMMIT}'",
                             returnStdout: true
                         ).trim()
 
-                        def changedFiles = changedOutput ?
-                            changedOutput.readLines() : []
+                        def changedFiles = changedOutput ? changedOutput.readLines() : []
 
                         echo '===== CHANGED FILES ====='
-
-                        changedFiles.each { file ->
-                            echo file
+                        if (changedFiles.isEmpty()) {
+                            echo 'No files changed between the successful baseline and this commit.'
+                        } else {
+                            changedFiles.each { file -> echo file }
                         }
 
-                        if (changedFiles.isEmpty()) {
-                            echo 'No changed files detected. Safe fallback: build both.'
-
-                            buildBackend = true
-                            buildFrontend = true
-
-                        } else {
-
-                            changedFiles.each { file ->
-
-                                if (file.startsWith('app/server/')) {
-                                    buildBackend = true
-                                    echo "Backend change detected: ${file}"
-
-                                } else if (file.startsWith('app/client/')) {
-                                    buildFrontend = true
-                                    echo "Frontend change detected: ${file}"
-
-                                } else if (
-                                    file.startsWith('jenkins/') ||
-                                    file == 'Jenkinsfile' ||
-                                    file == 'package.json' ||
-                                    file == 'package-lock.json' ||
-                                    file == '.gitignore' ||
-                                    file.startsWith('app/')
-                                ) {
-                                    // Shared or CI changes affect both.
-
-                                    buildBackend = true
-                                    buildFrontend = true
-
-                                    echo "Shared configuration change detected: ${file}"
-
-                                } else if (
-                                    file.startsWith('docs/') ||
-                                    file.toLowerCase().endsWith('.md') ||
-                                    file == 'LICENSE'
-                                ) {
-                                    echo "Documentation-only change: ${file}"
-
-                                } else {
-                                    // Unknown changes use a safe default.
-
-                                    buildBackend = true
-                                    buildFrontend = true
-
-                                    echo "Unclassified change; building both: ${file}"
-                                }
+                        changedFiles.each { file ->
+                            if (file.startsWith('app/server/')) {
+                                buildBackend = true
+                                echo "Backend change detected: ${file}"
+                            } else if (file.startsWith('app/client/')) {
+                                buildFrontend = true
+                                echo "Frontend change detected: ${file}"
+                            } else if (
+                                file.startsWith('jenkins/') ||
+                                file.startsWith('.github/') ||
+                                file == 'Jenkinsfile' ||
+                                file == 'package.json' ||
+                                file == 'package-lock.json' ||
+                                file == '.gitignore' ||
+                                file.startsWith('app/')
+                            ) {
+                                // Shared application or CI configuration affects both images.
+                                buildBackend = true
+                                buildFrontend = true
+                                echo "Shared configuration change detected: ${file}"
+                            } else if (
+                                file.startsWith('docs/') ||
+                                file.toLowerCase().endsWith('.md') ||
+                                file == 'LICENSE'
+                            ) {
+                                echo "Documentation-only change: ${file}"
+                            } else {
+                                // Unknown paths use a safe default.
+                                buildBackend = true
+                                buildFrontend = true
+                                echo "Unclassified change; building both: ${file}"
                             }
                         }
                     }
@@ -166,23 +153,11 @@ pipeline {
             }
         }
 
-        // ==========================================
-        // 4. VERIFY PROJECT STRUCTURE
-        // ==========================================
-
         stage('Verify Project Structure') {
-            when {
-                expression {
-                    env.BUILD_BACKEND == 'true' ||
-                    env.BUILD_FRONTEND == 'true'
-                }
-            }
-
             steps {
                 sh '''
                     set -eu
-
-                    echo "===== VERIFYING PROJECT FILES ====="
+                    echo '===== VERIFYING PROJECT FILES ====='
 
                     if [ "$BUILD_BACKEND" = "true" ]; then
                         test -f app/server/package.json
@@ -198,20 +173,15 @@ pipeline {
                         test -f app/client/nginx.conf
                     fi
 
-                    echo "Project structure verified!"
+                    echo 'Project structure verified.'
                 '''
             }
         }
-
-        // ==========================================
-        // BACKEND CI
-        // ==========================================
 
         stage('Backend Dependency Installation') {
             when {
                 expression { env.BUILD_BACKEND == 'true' }
             }
-
             steps {
                 dir('app/server') {
                     sh 'npm ci'
@@ -223,7 +193,6 @@ pipeline {
             when {
                 expression { env.BUILD_BACKEND == 'true' }
             }
-
             steps {
                 dir('app/server') {
                     sh 'npm run lint'
@@ -235,120 +204,82 @@ pipeline {
             when {
                 expression { env.BUILD_BACKEND == 'true' }
             }
-
             steps {
                 dir('app/server') {
-                    withEnv([
-                        "TEST_DB_CONTAINER=jenkins-test-db-${env.BUILD_NUMBER}",
-                        "POSTGRES_USER=ci_user",
-                        "POSTGRES_PASSWORD=ci-only-temporary-password",
-                        "POSTGRES_DB_TEST=enterprise_test",
-                        "SECRET=ci-only-test-access-secret",
-                        "REFRESH_SECRET=ci-only-test-refresh-secret"
-                    ]) {
-                        sh '''
-                            set +x
-                            set -eu
+                    sh '''
+                        set -eu
+                        set +x
 
-                            cleanup() {
-                                echo "===== CLEANING TEST DATABASE ====="
-                                docker rm -f "$TEST_DB_CONTAINER" \
-                                    >/dev/null 2>&1 || true
-                            }
+                        DB_CONTAINER="jenkins-test-db-${BUILD_NUMBER}"
+                        DB_NAME='enterprise_test'
+                        DB_USER='ci_user'
+                        DB_PASSWORD='ci_only_password'
 
-                            trap cleanup EXIT
+                        cleanup() {
+                            docker rm -f "$DB_CONTAINER" >/dev/null 2>&1 || true
+                        }
+                        trap cleanup EXIT
 
-                            echo "===== STARTING TEST POSTGRESQL ====="
+                        echo '===== STARTING TEST POSTGRESQL ====='
+                        docker rm -f "$DB_CONTAINER" >/dev/null 2>&1 || true
 
-                            docker run -d \
-                                --name "$TEST_DB_CONTAINER" \
-                                --restart=no \
-                                --memory=512m \
-                                -e POSTGRES_USER="$POSTGRES_USER" \
-                                -e POSTGRES_PASSWORD="$POSTGRES_PASSWORD" \
-                                -e POSTGRES_DB="$POSTGRES_DB_TEST" \
-                                -p 127.0.0.1::5432 \
-                                --health-cmd="pg_isready -U $POSTGRES_USER -d $POSTGRES_DB_TEST" \
-                                --health-interval=5s \
-                                --health-timeout=3s \
-                                --health-retries=20 \
-                                postgres:18 >/dev/null
+                        docker run -d \\
+                            --name "$DB_CONTAINER" \\
+                            --restart=no \\
+                            -e POSTGRES_USER="$DB_USER" \\
+                            -e POSTGRES_PASSWORD="$DB_PASSWORD" \\
+                            -e POSTGRES_DB="$DB_NAME" \\
+                            -p 127.0.0.1::5432 \\
+                            postgres:18 >/dev/null
 
-                            echo "===== WAITING FOR POSTGRESQL ====="
-
-                            status=starting
-
-                            for attempt in $(seq 1 30); do
-                                status=$(docker inspect \
-                                    --format='{{.State.Health.Status}}' \
-                                    "$TEST_DB_CONTAINER")
-
-                                if [ "$status" = "healthy" ]; then
-                                    break
-                                fi
-
-                                container_state=$(docker inspect \
-                                    --format='{{.State.Status}}' \
-                                    "$TEST_DB_CONTAINER")
-
-                                if [ "$container_state" = "exited" ] || \
-                                   [ "$container_state" = "dead" ]; then
-                                    docker logs "$TEST_DB_CONTAINER"
-                                    exit 1
-                                fi
-
-                                sleep 2
-                            done
-
-                            if [ "$status" != "healthy" ]; then
-                                echo "PostgreSQL failed to become healthy"
-                                docker logs "$TEST_DB_CONTAINER"
-                                exit 1
+                        echo '===== WAITING FOR POSTGRESQL ====='
+                        DB_READY='false'
+                        for attempt in $(seq 1 30); do
+                            if docker exec "$DB_CONTAINER" pg_isready -U "$DB_USER" -d "$DB_NAME" >/dev/null 2>&1; then
+                                DB_READY='true'
+                                break
                             fi
+                            sleep 2
+                        done
 
-                            echo "PostgreSQL is healthy!"
+                        if [ "$DB_READY" != 'true' ]; then
+                            echo 'PostgreSQL did not become ready.'
+                            docker logs "$DB_CONTAINER" || true
+                            exit 1
+                        fi
 
-                            POSTGRES_PORT=$(docker port \
-                                "$TEST_DB_CONTAINER" 5432/tcp \
-                                | awk -F: 'NR == 1 {print $NF}')
+                        DB_PORT="$(docker port "$DB_CONTAINER" 5432/tcp | awk -F: 'NR == 1 {print $NF}')"
+                        if [ -z "$DB_PORT" ]; then
+                            echo 'Could not determine the temporary PostgreSQL host port.'
+                            exit 1
+                        fi
 
-                            if [ -z "$POSTGRES_PORT" ]; then
-                                echo "Could not determine PostgreSQL port"
-                                exit 1
-                            fi
+                        echo '===== INITIALIZING TEST DATABASE ====='
+                        docker exec -i "$DB_CONTAINER" \\
+                            psql -v ON_ERROR_STOP=1 -U "$DB_USER" -d "$DB_NAME" \\
+                            < config/init.sql
 
-                            export POSTGRES_HOST=127.0.0.1
-                            export POSTGRES_PORT
-                            export NODE_ENV=test
+                        export NODE_ENV='test'
+                        export POSTGRES_HOST='127.0.0.1'
+                        export POSTGRES_PORT="$DB_PORT"
+                        export POSTGRES_USER="$DB_USER"
+                        export POSTGRES_PASSWORD="$DB_PASSWORD"
+                        export POSTGRES_DB_TEST="$DB_NAME"
+                        export JWT_SECRET='jenkins-test-only-secret'
+                        export JWT_REFRESH_SECRET='jenkins-test-only-refresh-secret'
 
-                            echo "===== INITIALIZING DATABASE SCHEMA ====="
-
-                            docker exec -i "$TEST_DB_CONTAINER" \
-                                psql -v ON_ERROR_STOP=1 \
-                                -U "$POSTGRES_USER" \
-                                -d "$POSTGRES_DB_TEST" \
-                                < config/init.sql
-
-                            echo "===== RUNNING BACKEND TESTS ====="
-
-                            npm test
-
-                            echo "Backend tests completed!"
-                        '''
-                    }
+                        echo '===== RUNNING BACKEND TESTS ====='
+                        npm test
+                        echo 'Backend tests completed.'
+                    '''
                 }
             }
         }
-
-        // ==========================================
-        // FRONTEND CI
-        // ==========================================
 
         stage('Frontend Dependency Installation') {
             when {
                 expression { env.BUILD_FRONTEND == 'true' }
             }
-
             steps {
                 dir('app/client') {
                     sh 'npm ci --legacy-peer-deps'
@@ -360,59 +291,41 @@ pipeline {
             when {
                 expression { env.BUILD_FRONTEND == 'true' }
             }
-
             steps {
                 dir('app/client') {
                     sh '''
                         set -eu
-
-                        echo "===== CHECKING FRONTEND SCRIPTS ====="
-
-                        node -e "
-                            const p = require('./package.json');
-                            console.log(JSON.stringify(p.scripts || {}, null, 2));
-                        "
+                        echo '===== CHECKING FRONTEND SCRIPTS ====='
 
                         if node -e "process.exit(require('./package.json').scripts?.lint ? 0 : 1)"; then
-                            echo "===== RUNNING FRONTEND LINT ====="
+                            echo '===== RUNNING FRONTEND LINT ====='
                             npm run lint
                         else
-                            echo "No frontend lint script configured; skipping."
+                            echo 'No frontend lint script configured; skipping.'
                         fi
 
                         if node -e "process.exit(require('./package.json').scripts?.test ? 0 : 1)"; then
-                            echo "===== RUNNING FRONTEND TESTS ====="
-                            npm test -- --run
+                            echo '===== RUNNING FRONTEND TESTS ====='
+                            npm test
                         else
-                            echo "No frontend test script configured; skipping."
+                            echo 'No frontend test script configured; skipping.'
                         fi
                     '''
                 }
             }
         }
 
-        // ==========================================
-        // BACKEND DOCKER
-        // ==========================================
-
         stage('Build Backend Docker Image') {
             when {
                 expression { env.BUILD_BACKEND == 'true' }
             }
-
             steps {
                 dir('app/server') {
                     sh '''
                         set -eu
-
-                        echo "===== BUILDING BACKEND IMAGE ====="
-
-                        docker build --pull \
-                            -f Dockerfile.prod \
-                            -t enterprise-backend:${IMAGE_TAG} \
-                            .
-
-                        echo "Backend image built successfully!"
+                        echo '===== BUILDING BACKEND IMAGE ====='
+                        docker build --pull -f Dockerfile.prod -t "enterprise-backend:${IMAGE_TAG}" .
+                        echo 'Backend image built successfully.'
                     '''
                 }
             }
@@ -422,109 +335,79 @@ pipeline {
             when {
                 expression { env.BUILD_BACKEND == 'true' }
             }
-
             steps {
-                withEnv([
-                    "TEST_CONTAINER=jenkins-backend-test-${env.BUILD_NUMBER}",
-                    "TEST_IMAGE=enterprise-backend:${env.IMAGE_TAG}"
-                ]) {
-                    sh '''
-                        set -eu
+                sh '''
+                    set -eu
+                    CONTAINER_NAME="jenkins-backend-test-${BUILD_NUMBER}"
 
-                        cleanup() {
-                            docker rm -f "$TEST_CONTAINER" \
-                                >/dev/null 2>&1 || true
-                        }
+                    cleanup() {
+                        docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
+                    }
+                    trap cleanup EXIT
 
-                        trap cleanup EXIT
+                    docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
 
-                        echo "===== STARTING BACKEND CONTAINER ====="
+                    echo '===== STARTING BACKEND CONTAINER ====='
+                    docker run -d \\
+                        --name "$CONTAINER_NAME" \\
+                        --restart=no \\
+                        --memory=512m \\
+                        -e PORT=9000 \\
+                        -p 127.0.0.1::9000 \\
+                        "enterprise-backend:${IMAGE_TAG}" >/dev/null
 
-                        docker run -d \
-                            --name "$TEST_CONTAINER" \
-                            --restart=no \
-                            --memory=512m \
-                            -e PORT=9000 \
-                            -p 127.0.0.1::9000 \
-                            "$TEST_IMAGE" >/dev/null
+                    echo '===== WAITING FOR BACKEND HEALTH ====='
+                    HEALTH_STATUS='starting'
+                    for attempt in $(seq 1 40); do
+                        HEALTH_STATUS="$(docker inspect --format='{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$CONTAINER_NAME")"
+                        CONTAINER_STATE="$(docker inspect --format='{{.State.Status}}' "$CONTAINER_NAME")"
 
-                        echo "===== WAITING FOR BACKEND HEALTH ====="
-
-                        status=starting
-
-                        for attempt in $(seq 1 40); do
-                            status=$(docker inspect \
-                                --format='{{.State.Health.Status}}' \
-                                "$TEST_CONTAINER")
-
-                            if [ "$status" = "healthy" ]; then
-                                break
-                            fi
-
-                            container_state=$(docker inspect \
-                                --format='{{.State.Status}}' \
-                                "$TEST_CONTAINER")
-
-                            if [ "$container_state" = "exited" ] || \
-                               [ "$container_state" = "dead" ]; then
-                                docker logs "$TEST_CONTAINER"
-                                exit 1
-                            fi
-
-                            sleep 3
-                        done
-
-                        if [ "$status" != "healthy" ]; then
-                            docker logs "$TEST_CONTAINER"
-                            docker inspect "$TEST_CONTAINER"
+                        if [ "$CONTAINER_STATE" = 'exited' ] || [ "$CONTAINER_STATE" = 'dead' ]; then
+                            echo 'Backend container stopped unexpectedly.'
+                            docker logs "$CONTAINER_NAME" || true
                             exit 1
                         fi
 
-                        echo "===== CHECKING BACKEND HTTP ENDPOINT ====="
-
-                        HOST_PORT=$(docker port "$TEST_CONTAINER" 9000/tcp \
-                            | awk -F: 'NR == 1 {print $NF}')
-
-                        HTTP_STATUS=$(curl -sS \
-                            -o /tmp/backend-health-${BUILD_NUMBER}.json \
-                            -w '%{http_code}' \
-                            "http://127.0.0.1:${HOST_PORT}/health")
-
-                        cat "/tmp/backend-health-${BUILD_NUMBER}.json"
-
-                        if [ "$HTTP_STATUS" != "200" ]; then
-                            echo "Backend HTTP health validation failed"
-                            exit 1
+                        if [ "$HEALTH_STATUS" = 'healthy' ]; then
+                            break
                         fi
+                        sleep 3
+                    done
 
-                        echo "Backend image passed validation!"
-                    '''
-                }
+                    if [ "$HEALTH_STATUS" != 'healthy' ]; then
+                        echo "Backend Docker health check failed: $HEALTH_STATUS"
+                        docker logs "$CONTAINER_NAME" || true
+                        exit 1
+                    fi
+
+                    echo '===== CHECKING BACKEND HTTP ENDPOINT ====='
+                    HOST_PORT="$(docker port "$CONTAINER_NAME" 9000/tcp | awk -F: 'NR == 1 {print $NF}')"
+                    HTTP_STATUS="$(curl -sS -o "/tmp/backend-health-${BUILD_NUMBER}.json" -w '%{http_code}' "http://127.0.0.1:${HOST_PORT}/health" || true)"
+                    cat "/tmp/backend-health-${BUILD_NUMBER}.json" 2>/dev/null || true
+                    echo ''
+
+                    if [ "$HTTP_STATUS" != '200' ]; then
+                        echo "Backend health endpoint returned HTTP $HTTP_STATUS"
+                        docker logs "$CONTAINER_NAME" || true
+                        exit 1
+                    fi
+
+                    echo 'Backend image passed validation.'
+                '''
             }
         }
-
-        // ==========================================
-        // FRONTEND DOCKER
-        // ==========================================
 
         stage('Build Frontend Docker Image') {
             when {
                 expression { env.BUILD_FRONTEND == 'true' }
             }
-
             steps {
                 dir('app/client') {
                     sh '''
                         set -eu
-
-                        echo "===== BUILDING FRONTEND IMAGE ====="
-
-                        docker build --pull \
-                            -f Dockerfile.prod \
-                            -t enterprise-frontend:${IMAGE_TAG} \
-                            .
-
-                        echo "Frontend image built successfully!"
+                        echo '===== BUILDING FRONTEND IMAGE ====='
+                        docker build --pull -f Dockerfile.prod -t "enterprise-frontend:${IMAGE_TAG}" .
+                        echo 'Frontend image built successfully.'
                     '''
                 }
             }
@@ -534,202 +417,165 @@ pipeline {
             when {
                 expression { env.BUILD_FRONTEND == 'true' }
             }
-
-            steps {
-                withEnv([
-                    "TEST_CONTAINER=jenkins-frontend-test-${env.BUILD_NUMBER}",
-                    "TEST_IMAGE=enterprise-frontend:${env.IMAGE_TAG}"
-                ]) {
-                    sh '''
-                        set -eu
-
-                        cleanup() {
-                            docker rm -f "$TEST_CONTAINER" \
-                                >/dev/null 2>&1 || true
-                        }
-
-                        trap cleanup EXIT
-
-                        echo "===== STARTING FRONTEND CONTAINER ====="
-
-                        docker run -d \
-                            --name "$TEST_CONTAINER" \
-                            --restart=no \
-                            --memory=256m \
-                            -p 127.0.0.1::80 \
-                            "$TEST_IMAGE" >/dev/null
-
-                        echo "===== WAITING FOR NGINX ====="
-
-                        HOST_PORT=$(docker port "$TEST_CONTAINER" 80/tcp \
-                            | awk -F: 'NR == 1 {print $NF}')
-
-                        HTTP_STATUS=000
-
-                        for attempt in $(seq 1 30); do
-                            HTTP_STATUS=$(curl -sS \
-                                -o /tmp/frontend-health-${BUILD_NUMBER}.html \
-                                -w '%{http_code}' \
-                                "http://127.0.0.1:${HOST_PORT}/" \
-                                || true)
-
-                            if [ "$HTTP_STATUS" = "200" ]; then
-                                break
-                            fi
-
-                            sleep 2
-                        done
-
-                        if [ "$HTTP_STATUS" != "200" ]; then
-                            echo "Frontend HTTP validation failed"
-                            docker logs "$TEST_CONTAINER"
-                            exit 1
-                        fi
-
-                        echo "Frontend HTTP response:"
-                        head -c 500 "/tmp/frontend-health-${BUILD_NUMBER}.html"
-
-                        echo ""
-                        echo "Frontend image passed validation!"
-                    '''
-                }
-            }
-        }
-
-        // ==========================================
-        // ECR AUTHENTICATION
-        // ==========================================
-
-        stage('Authenticate with Amazon ECR') {
-            when {
-                expression {
-                    env.BUILD_BACKEND == 'true' ||
-                    env.BUILD_FRONTEND == 'true'
-                }
-            }
-
             steps {
                 sh '''
                     set -eu
+                    CONTAINER_NAME="jenkins-frontend-test-${BUILD_NUMBER}"
 
-                    echo "===== AUTHENTICATING WITH ECR ====="
+                    cleanup() {
+                        docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
+                    }
+                    trap cleanup EXIT
 
-                    aws ecr get-login-password \
-                        --region "$AWS_REGION" | \
-                    docker login \
-                        --username AWS \
-                        --password-stdin "$ECR_REGISTRY"
+                    docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
+
+                    echo '===== STARTING FRONTEND CONTAINER ====='
+                    docker run -d \\
+                        --name "$CONTAINER_NAME" \\
+                        --restart=no \\
+                        --memory=256m \\
+                        -p 127.0.0.1::80 \\
+                        "enterprise-frontend:${IMAGE_TAG}" >/dev/null
+
+                    echo '===== WAITING FOR NGINX ====='
+                    HOST_PORT="$(docker port "$CONTAINER_NAME" 80/tcp | awk -F: 'NR == 1 {print $NF}')"
+                    HTTP_STATUS='000'
+
+                    for attempt in $(seq 1 30); do
+                        HTTP_STATUS="$(curl -sS -o "/tmp/frontend-health-${BUILD_NUMBER}.html" -w '%{http_code}' "http://127.0.0.1:${HOST_PORT}/" 2>/dev/null || true)"
+                        if [ "$HTTP_STATUS" = '200' ]; then
+                            break
+                        fi
+                        sleep 2
+                    done
+
+                    if [ "$HTTP_STATUS" != '200' ]; then
+                        echo "Frontend returned HTTP $HTTP_STATUS"
+                        docker logs "$CONTAINER_NAME" || true
+                        exit 1
+                    fi
+
+                    echo 'Frontend HTTP response:'
+                    head -c 500 "/tmp/frontend-health-${BUILD_NUMBER}.html" || true
+                    echo ''
+                    echo 'Frontend image passed validation.'
                 '''
             }
         }
 
-        // ==========================================
-        // PUSH BACKEND IMAGE
-        // ==========================================
+        stage('Authenticate with Amazon ECR') {
+            when {
+                expression {
+                    env.BUILD_BACKEND == 'true' || env.BUILD_FRONTEND == 'true'
+                }
+            }
+            steps {
+                sh '''
+                    set -eu
+                    echo '===== AUTHENTICATING WITH ECR ====='
+                    aws ecr get-login-password --region "$AWS_REGION" \\
+                        | docker login --username AWS --password-stdin "$ECR_REGISTRY"
+                '''
+            }
+        }
 
         stage('Push Backend Image to ECR') {
             when {
                 expression { env.BUILD_BACKEND == 'true' }
             }
-
             steps {
                 sh '''
                     set -eu
-
                     ECR_IMAGE="${ECR_REGISTRY}/${BACKEND_ECR_REPOSITORY}:${IMAGE_TAG}"
 
-                    echo "===== TAGGING BACKEND IMAGE ====="
+                    echo '===== TAGGING BACKEND IMAGE ====='
+                    docker tag "enterprise-backend:${IMAGE_TAG}" "$ECR_IMAGE"
 
-                    docker tag \
-                        "enterprise-backend:${IMAGE_TAG}" \
-                        "$ECR_IMAGE"
-
-                    echo "===== PUSHING BACKEND IMAGE ====="
-
+                    echo '===== PUSHING BACKEND IMAGE ====='
                     docker push "$ECR_IMAGE"
 
-                    echo "===== VERIFYING BACKEND IMAGE ====="
+                    echo '===== VERIFYING BACKEND IMAGE ====='
+                    IMAGE_DIGEST="$(aws ecr describe-images \\
+                        --repository-name "$BACKEND_ECR_REPOSITORY" \\
+                        --region "$AWS_REGION" \\
+                        --image-ids "imageTag=${IMAGE_TAG}" \\
+                        --query 'imageDetails[0].imageDigest' \\
+                        --output text)"
 
-                    aws ecr describe-images \
-                        --repository-name "$BACKEND_ECR_REPOSITORY" \
-                        --region "$AWS_REGION" \
-                        --image-ids imageTag="$IMAGE_TAG" \
-                        --output json
+                    if [ -z "$IMAGE_DIGEST" ] || [ "$IMAGE_DIGEST" = 'None' ]; then
+                        echo 'Backend image was not found in ECR after push.'
+                        exit 1
+                    fi
+
+                    echo "Backend image: $ECR_IMAGE"
+                    echo "Backend digest: $IMAGE_DIGEST"
                 '''
             }
         }
-
-        // ==========================================
-        // PUSH FRONTEND IMAGE
-        // ==========================================
 
         stage('Push Frontend Image to ECR') {
             when {
                 expression { env.BUILD_FRONTEND == 'true' }
             }
-
             steps {
                 sh '''
                     set -eu
-
                     ECR_IMAGE="${ECR_REGISTRY}/${FRONTEND_ECR_REPOSITORY}:${IMAGE_TAG}"
 
-                    echo "===== TAGGING FRONTEND IMAGE ====="
+                    echo '===== TAGGING FRONTEND IMAGE ====='
+                    docker tag "enterprise-frontend:${IMAGE_TAG}" "$ECR_IMAGE"
 
-                    docker tag \
-                        "enterprise-frontend:${IMAGE_TAG}" \
-                        "$ECR_IMAGE"
-
-                    echo "===== PUSHING FRONTEND IMAGE ====="
-
+                    echo '===== PUSHING FRONTEND IMAGE ====='
                     docker push "$ECR_IMAGE"
 
-                    echo "===== VERIFYING FRONTEND IMAGE ====="
+                    echo '===== VERIFYING FRONTEND IMAGE ====='
+                    IMAGE_DIGEST="$(aws ecr describe-images \\
+                        --repository-name "$FRONTEND_ECR_REPOSITORY" \\
+                        --region "$AWS_REGION" \\
+                        --image-ids "imageTag=${IMAGE_TAG}" \\
+                        --query 'imageDetails[0].imageDigest' \\
+                        --output text)"
 
-                    aws ecr describe-images \
-                        --repository-name "$FRONTEND_ECR_REPOSITORY" \
-                        --region "$AWS_REGION" \
-                        --image-ids imageTag="$IMAGE_TAG" \
-                        --output json
+                    if [ -z "$IMAGE_DIGEST" ] || [ "$IMAGE_DIGEST" = 'None' ]; then
+                        echo 'Frontend image was not found in ECR after push.'
+                        exit 1
+                    fi
+
+                    echo "Frontend image: $ECR_IMAGE"
+                    echo "Frontend digest: $IMAGE_DIGEST"
                 '''
             }
         }
     }
 
-    // ==========================================
-    // POST BUILD ACTIONS
-    // ==========================================
-
     post {
         success {
-            echo 'Selective CI and ECR publishing completed successfully.'
-
-            echo "Commit: ${env.IMAGE_TAG}"
-            echo "Backend built: ${env.BUILD_BACKEND}"
-            echo "Frontend built: ${env.BUILD_FRONTEND}"
-
             script {
-                if (env.BUILD_BACKEND == 'true') {
-                    echo "Backend image: ${env.ECR_REGISTRY}/${env.BACKEND_ECR_REPOSITORY}:${env.IMAGE_TAG}"
+                // This marker becomes the baseline for the next successful run.
+                if (env.CURRENT_COMMIT?.trim()) {
+                    currentBuild.description = "CI_COMMIT=${env.CURRENT_COMMIT} | BACKEND=${env.BUILD_BACKEND} | FRONTEND=${env.BUILD_FRONTEND}"
                 }
 
-                if (env.BUILD_FRONTEND == 'true') {
-                    echo "Frontend image: ${env.ECR_REGISTRY}/${env.FRONTEND_ECR_REPOSITORY}:${env.IMAGE_TAG}"
-                }
-
-                if (env.BUILD_BACKEND == 'false' &&
-                    env.BUILD_FRONTEND == 'false') {
-                    echo 'Documentation-only change. No images were built or pushed.'
+                if (env.BUILD_BACKEND == 'false' && env.BUILD_FRONTEND == 'false') {
+                    echo 'Pipeline completed successfully. No application image changes were detected; image builds and pushes were skipped.'
+                } else {
+                    echo 'Selective CI and ECR publishing completed successfully.'
+                    if (env.BUILD_BACKEND == 'true') {
+                        echo "Backend image: ${env.ECR_REGISTRY}/${env.BACKEND_ECR_REPOSITORY}:${env.IMAGE_TAG}"
+                    }
+                    if (env.BUILD_FRONTEND == 'true') {
+                        echo "Frontend image: ${env.ECR_REGISTRY}/${env.FRONTEND_ECR_REPOSITORY}:${env.IMAGE_TAG}"
+                    }
                 }
             }
         }
 
         failure {
-            echo 'Pipeline failed. Check the Jenkins console output.'
+            echo 'Pipeline failed. The previous successful commit remains the comparison baseline.'
         }
 
         always {
-            echo 'Pipeline execution finished.'
+            echo "Finished Jenkins build #${BUILD_NUMBER}."
         }
     }
 }
