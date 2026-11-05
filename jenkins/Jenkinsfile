@@ -34,7 +34,11 @@ pipeline {
                         returnStdout: true
                     ).trim()
 
-                    env.IMAGE_TAG = env.CURRENT_COMMIT.take(7)
+                    if (!env.CURRENT_COMMIT) {
+                        error('Unable to determine current Git commit.')
+                    }
+
+                    env.IMAGE_TAG = env.CURRENT_COMMIT.substring(0, 7)
 
                     sh '''
                         set -eu
